@@ -1,0 +1,325 @@
+-- ROPO c сегментами и доп распозначанием все хосты
+create OR REPLACE table `hallowed-object-285011.reports.tav_ropo_data_from_202306_all_hosts` as 
+with  
+  dates as (
+    select
+      date '2023-06-01' as first,
+      date '2023-09-18' as last, 
+      60 as sleep_time, 
+      6 as trans_window),
+auth as 
+  (SELECT 
+    distinct
+    attribution.anonymousId as anonymousId,
+    max(if (attribution.userId is not null,safe_cast(attribution.userId as int), -- авторизация
+        if(ghc.userId is not null,safe_cast(ghc.userId as int), -- истор_ga
+          if(goc.userId is not null,safe_cast(goc.userId as int), -- своя кука
+            if(gsc.crm_id is not null,safe_cast(gsc.crm_id as int), -- crm_коммуникации
+              if(gac.crm_id is not null,safe_cast(gsc.crm_id as int), -- регистрация карты в розыгрыше
+                if(ygc.ya_crm_id is not null,safe_cast(ygc.ya_crm_id as int), -- яндекс
+                  null))))))) as v_userId
+    FROM `hallowed-object-285011.segmentstream_202204.attribution` attribution,dates
+    left join `hallowed-object-285011.deanonymization.ga_id__crm_id__with_ga_history_auth` ghc on ghc.anonymousId = attribution.anonymousId
+    left join `hallowed-object-285011.deanonymization.ga_id__crm_id__with_own_cooki` goc on goc.anonymousId = attribution.anonymousId
+    left join `hallowed-object-285011.deanonymization.connect_googleId_yandexId` as ygc on ygc.ga_id = attribution.anonymousId
+    left join `hallowed-object-285011.deanonymization.ga_id__crm_id__with_sap_outbound_id` as gsc on gsc.anonymousId = attribution.anonymousId
+    left join `hallowed-object-285011.deanonymization.ga_id__crm_id__with_actions` as gac on gac.anonymousId = attribution.anonymousId
+    WHERE 0=0
+      and (date between first and last)
+      and data_source_id = 'ba2e5550-e49c-408f-b983-9eb227a4cce6'
+    group by 1
+  ),
+sales_pre_1 as -- продажи до 20230601
+  (SELECT 
+      PARSE_TIMESTAMP('%Y%m%d%H%M%S',concat(rc_rt_fdy,time)) as sales_dt,
+      pos_rec_itm.calday as calday,
+      pos_rec_itm.check_id as check_id,
+      safe_cast(bic_client as int) as s_userId,
+      sum(rtsaexcust) as rev
+    FROM `lentamainapp.hadoop.pos_rec_itm_new` pos_rec_itm,dates 
+    left join --убрать еком
+      (select distinct check_id from `lentamainapp.hadoop.pos_rec_itm_new` ,dates
+      where (calday between FORMAT_TIMESTAMP("%Y%m%d", TIMESTAMP_ADD(first,INTERVAL - sleep_time day)) and '20230531') and bic_zinstype not in ('00','01','02','03')) sales_ecom
+        on sales_ecom.check_id=pos_rec_itm.check_id
+    where 0=0
+      and (pos_rec_itm.calday between FORMAT_TIMESTAMP("%Y%m%d", TIMESTAMP_ADD(first,INTERVAL - sleep_time day)) and '20230531')
+      and bic_zinstype in ('00','01','02','03') 
+    group  by 1,2,3,4
+    having rev>0
+  ),
+  sales_pre_2 as  -- продажи после 20230601
+  (SELECT 
+      distinct
+      PARSE_TIMESTAMP('%Y%m%d%H%M%S',concat(rc_rt_fdy,time)) as sales_dt,
+      pos_rec_itm.calday as calday,
+      pos_rec_itm.check_id as check_id,
+      safe_cast(bic_client as int) as s_userId,
+      sum(rtsaexcust) as rev
+    FROM `lentamainapp.hadoop.pos_rec_itm_from_202306` pos_rec_itm,dates
+    left join --убрать еком
+      (select distinct check_id from `lentamainapp.hadoop.pos_rec_itm_from_202306` ,dates
+      where (calday between '20230601' and FORMAT_TIMESTAMP("%Y%m%d", TIMESTAMP_ADD(last,INTERVAL trans_window day))) and bic_zinstype not in ('00','01','02','03')) sales_ecom
+      on sales_ecom.check_id=pos_rec_itm.check_id
+    left join `lentamainapp.hadoop.first_users_check` first_users_check on first_users_check.check_id = pos_rec_itm.check_id
+    where 0=0
+      and (pos_rec_itm.calday between '20230601' and FORMAT_TIMESTAMP("%Y%m%d", TIMESTAMP_ADD(last,INTERVAL trans_window day)))
+      and bic_zinstype in ('00','01','02','03') 
+    group by 1,2,3,4
+    having rev>0
+  ),
+  sales as -- объединение до/после 20230601 наложение сегментов
+  (
+    Select
+      distinct 
+      sales_dt,
+      sales_pre_3.calday as calday,
+      sales_pre_3.check_id as check_id,
+      s_userId,
+      rev,
+      if(first_users_check.check_id is not null,'new',
+        if (TIMESTAMP_DIFF( sales_dt,LAG(sales_dt, 1) OVER (PARTITION BY s_userId ORDER BY sales_dt),day)>=30*2 
+          or LAG(sales_dt, 1) OVER (PARTITION BY s_userId ORDER BY sales_dt) is null,'sleep',
+          'active')) as check_type
+    from 
+      (select * from sales_pre_1 group by 1,2,3,4,5 
+          union all
+        select * from sales_pre_2 group by 1,2,3,4,5 
+      ) as sales_pre_3
+    left join `lentamainapp.hadoop.first_users_check` first_users_check on first_users_check.check_id = sales_pre_3.check_id
+  ),
+  visits as(
+    SELECT  
+      TIMESTAMP_ADD(visit_start,INTERVAL 3 hour) as visits_dt,
+      if (NET.HOST(landingPage.url) like '%online.lenta.com%','online.lenta.com',NET.HOST(landingPage.url)) as hosts,
+      attribution.anonymousId as anonymousId,
+      sessionId,
+      totals.bounces as bounces, 
+      totals.timeOnSite as timeOnSite, 
+      totals.pageViews as pageViews, 
+      totals.firstVisits as firstVisits,
+      ip,
+      date,
+      case
+        when (trafficSource.source is null and (landingPage.url like '%utm_referrer%yandex%' or landingPage.url like '%utm_referrer%google%')) then 'Organic Search'
+        else `hallowed-object-285011.segmentstream`.get_channel_grouping (ad.source, ad.medium, ad.campaign, '', '')
+      end as channel_grouping,
+      if (trafficSource.source is null and landingPage.url like '%utm_referrer%yandex%','yandex',
+        if (trafficSource.source is null and landingPage.url like '%utm_referrer%google%', 'google',ad.source)) as source,
+      if (trafficSource.source is null and (landingPage.url like '%utm_referrer%yandex%' or landingPage.url like '%utm_referrer%google%'),'organic',ad.medium) as medium,
+      if (trafficSource.source is null and (landingPage.url like '%utm_referrer%yandex%' or landingPage.url like '%utm_referrer%google%'),null,ad.campaign) as campaign,
+      if (userId is not null,safe_cast(userId as int),auth.v_userId) as v_userId,
+    FROM `hallowed-object-285011.segmentstream_202204.attribution` attribution ,dates
+    left join auth on auth.anonymousId = attribution.anonymousId
+    WHERE 0=0
+      and (date between first and last)
+    and data_source_id = 'ba2e5550-e49c-408f-b983-9eb227a4cce6'
+  ),
+  common as ( -- на 1 сессию может приходиться насколько чеков, на один чек только одна сессия. 
+    select 
+      distinct 
+      --визиты
+      date,
+      hosts,
+      visits_dt,
+      anonymousId,
+      sessionId,
+      channel_grouping,
+      source,
+      campaign,
+      v_userId,
+      --чеки
+      sales_dt,
+      check_id,
+      check_type,
+      rev,
+      TIMESTAMP_DIFF(sales_dt, visits_dt, second) as diff,
+      min(TIMESTAMP_DIFF(sales_dt, visits_dt, second)) over (partition by s_userId, sales_dt,rev) as min_diff
+    from sales,dates
+    left join visits on sales.s_userId = visits.v_userId
+    where 0=0
+      and TIMESTAMP_DIFF(sales_dt, visits_dt, day) between 0 and trans_window
+      and sales_dt > visits_dt
+  ),
+  ropo_sessions as -- сеансы ассоциированные с покупками
+  (
+    select 
+      sessionId,
+      check_type,
+      count(distinct check_id) as check_num,
+      sum(rev) as rev
+  from common
+  where 0=0
+    and diff = min_diff
+  group by 1,2
+  )
+  select 
+    date,
+    channel_grouping,
+    hosts,
+    source,
+    medium,
+    campaign,
+    if(sourse_dm.utm_sourse is not null and medium_dm.utm_medium is not null,true,false) as dm,
+    if(campaign_name.campaign_name is not null,campaign_name.campaign_name,'other') as campaign_name,
+    if(check_type is null,'not_ropo',check_type) as check_type,
+    count(distinct visits.sessionId) as session_num,
+    count(distinct ip) as ip_num,
+    count(distinct anonymousId) as client_num,
+    count(distinct case when bounces = 1 then visits.sessionId end) as bounces_session_num,
+    count(distinct case when pageViews >= 2 then visits.sessionId end) as two_plus_pageViews_session_num,
+    count(distinct case when timeOnSite/1000 >=  60*2 then visits.sessionId end) as two_plus_minutes_on_site_session_num,
+    count(distinct case when firstVisits = 1 then visits.sessionId end) as first_session_num,
+    count(distinct case when v_userId >0 then visits.sessionId end ) as auth_session_num,
+    count(distinct case when check_num >0 then visits.sessionId end ) as ropo_session_num,
+    sum(timeOnSite) as timeOnSite,
+    sum(pageViews) as pageViews,
+    sum(check_num) as all_check_num,
+    sum(rev) as all_rev,
+    sum(case when check_type = 'new' then check_num end) as new_check_num,
+    sum(case when check_type = 'new' then rev end) as new_rev,
+    sum(case when check_type = 'sleep' then check_num end) as sleepl_check_num,
+    sum(case when check_type = 'sleep' then rev end) as sleep_rev,
+    sum(case when check_type = 'active' then check_num end) as active_check_num,
+    sum(case when check_type = 'active' then rev end) as active_rev
+  from visits
+  left join ropo_sessions on ropo_sessions.sessionId = visits.sessionId
+  left join `hallowed-object-285011.temp.tav_campaign_name` as campaign_name on campaign_name.campaign_utm = visits.campaign
+  left join `hallowed-object-285011.reports.tav_sourse_dm` as sourse_dm on sourse_dm.utm_sourse = visits.source
+  left join `hallowed-object-285011.reports.tav_medium_dm` as medium_dm on medium_dm.utm_medium = visits.medium
+  group by 1,2,3,4,5,6,7,8,9
+
+
+
+
+
+
+-- Мониторинг распознавания
+create or replace table `hallowed-object-285011.reports.tav_auth_monitor_for_ropo` as 
+with  
+  dates as (
+    select
+      date '2023-06-01' as first,
+      date '2023-07-31' as last, 
+      )
+  SELECT 
+    date,
+    count(distinct attribution.anonymousId) as client_num,
+    count(distinct case when attribution.userId is not null then attribution.anonymousId end) as auth,
+    count(distinct case when ghc.userId is not null then attribution.anonymousId end) as google_history,
+    count(distinct case when goc.userId is not null then attribution.anonymousId end) as own_cookie,
+    count(distinct case when gsc.crm_id is not null then attribution.anonymousId end) as crm_links,
+    count(distinct case when gac.crm_id is not null then attribution.anonymousId end) as action_card,
+    count(distinct case when ygc.ya_crm_id is not null then attribution.anonymousId end) as yandex_cookie,
+    count(distinct case when 
+      ygc.ya_crm_id is not null
+        or gac.crm_id  is not null
+        or gsc.crm_id is not null
+        or goc.userId is not null
+        or ghc.userId is not null
+        or attribution.userId  is not null then attribution.anonymousId end) as total_auth
+    FROM `hallowed-object-285011.segmentstream_202204.attribution` attribution,dates
+    left join `hallowed-object-285011.deanonymization.ga_id__crm_id__with_ga_history_auth` ghc on ghc.anonymousId = attribution.anonymousId
+    left join `hallowed-object-285011.deanonymization.ga_id__crm_id__with_own_cooki` goc on goc.anonymousId = attribution.anonymousId
+    left join `hallowed-object-285011.deanonymization.connect_googleId_yandexId` as ygc on ygc.ga_id = attribution.anonymousId
+    left join `hallowed-object-285011.deanonymization.ga_id__crm_id__with_sap_outbound_id` as gsc on gsc.anonymousId = attribution.anonymousId
+    left join `hallowed-object-285011.deanonymization.ga_id__crm_id__with_actions` as gac on gac.anonymousId = attribution.anonymousId
+    WHERE 0=0
+      and (date between first and last)
+      and NET.HOST(landingPage.url) = 'lenta.com'
+      and data_source_id = 'ba2e5550-e49c-408f-b983-9eb227a4cce6'
+    group by 1
+
+
+
+
+
+
+--ROPO app в борд 500GB
+CREATE OR REPLACE TABLE `hallowed-object-285011.reports.tav_ropo_app` as 
+with 
+events as (
+  SELECT  
+    distinct
+    TIMESTAMP_ADD(TIMESTAMP_micros(event_timestamp),interval 3 hour) as e_date,
+    last_value(if((select value.string_value from unnest(user_properties) where key = 'shipping_method') = 'Доставка',
+      'Доставка', 'Магазин')) 
+        over (partition by event_date,user_id order by event_date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as shipping_method,
+    safe_cast(user_id as int) as user_id
+  FROM `lentamainapp.analytics_178661140.events_*`
+  where 0=0
+    and _TABLE_SUFFIX between '20230801' and '20230831'             -- ДАТА '20230601' and '20230831'
+    and event_name = 'session_start'
+),
+sales as (SELECT 
+      distinct
+      PARSE_TIMESTAMP('%Y%m%d%H%M%S',concat(rc_rt_fdy,time)) as s_date,
+      pos_rec_itm.calday as calday,
+      pos_rec_itm.check_id as check_id,
+      safe_cast(bic_client as int) as s_userId,
+      sum(rtsaexcust) as rev
+    FROM `lentamainapp.hadoop.pos_rec_itm_from_202306` pos_rec_itm
+    left join --убрать еком
+      (select distinct check_id from `lentamainapp.hadoop.pos_rec_itm_from_202306`
+      where (calday between '20230801' and '20230831')              -- ДАТА
+        and bic_zinstype not in ('00','01','02','03')) sales_ecom on sales_ecom.check_id=pos_rec_itm.check_id
+    where 0=0
+      and (pos_rec_itm.calday between '20230801' and '20230831')    -- ДАТА
+      and bic_zinstype in ('00','01','02','03') 
+    group by 1,2,3,4
+    having rev>0
+  ),
+sales_1 as(
+  Select 
+    PARSE_TIMESTAMP('%Y%m%d',calday) as s_date,
+    safe_cast(user_id as int) as user_id
+  from lentamainapp.temp.tav_dr_user
+),
+common as (
+  select 
+    distinct
+    e_date,
+    shipping_method,
+    sales.s_userId as user_id,
+    check_id,
+    rev,
+    TIMESTAMP_DIFF(sales.s_date, events.e_date, day) as diff,
+    min(TIMESTAMP_DIFF(sales.s_date, events.e_date, day)) over (partition by s_date,sales.s_userId) as min_sales_dif
+  from sales
+  left join events on sales.s_userId = events.user_id
+  where 0=0
+    and TIMESTAMP_DIFF(sales.s_date, events.e_date, day) between 0 and 7
+    and sales.s_date > events.e_date
+    and events.user_id is not null
+)
+select 
+  e_date as date,
+  shipping_method,
+  sum(case when type = 'all' then user_num end) as all_user,
+  sum(case when type = 'ropo' then user_num end) as ropo_user,
+  sum(check_num) as check_num,
+  sum(rev) as rev
+from
+(
+  select 
+    'ropo' as type,
+    FORMAT_TIMESTAMP("%Y-%m-%d", e_date) as e_date,
+    shipping_method,
+    count(distinct user_id) as user_num,
+    count(distinct check_id) as check_num,
+    sum(rev) as rev
+  from common
+  where diff = min_sales_dif
+  group by 1,2,3
+  union all
+  select 
+    'all' as type,
+    FORMAT_TIMESTAMP("%Y-%m-%d", e_date) as e_date,
+    shipping_method,
+    count(distinct user_id) as user_num,
+    0 as user_num,
+    0 as check_num
+  from events
+  group by 1,2,3
+)
+group by 1,2
+
